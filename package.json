@@ -1,0 +1,13 @@
+{
+  "name": "discovery",
+  "private": true,
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
