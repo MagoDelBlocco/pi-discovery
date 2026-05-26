@@ -786,9 +786,12 @@ export default function (pi: ExtensionAPI) {
 		injected = false;
 		sessionHasMessages = false;
 
-		// Check if session already has messages (resume/fork)
+		// Check if session already has user messages (resume/fork)
 		const entries = ctx.sessionManager.getEntries();
-		if (entries.length > 0) {
+		const hasUserMessages = entries.some(
+			(e) => e.type === "message" && e.message?.role === "user",
+		);
+		if (hasUserMessages) {
 			sessionHasMessages = true;
 		}
 
