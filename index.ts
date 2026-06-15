@@ -8,10 +8,15 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
-import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import { readFile, readdir } from "node:fs/promises";
 import { basename } from "node:path";
 import { join, relative, dirname, extname } from "node:path";
+
+const execAsync = promisify(exec);
+const MAX_DEPTH = 5;
+const MAX_FILES = 5000;
 
 // ── Config ────────────────────────────────────────────────────────
 
@@ -50,25 +55,28 @@ interface ProjectMeta {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-function run(cmd: string, cwd: string): string {
-	const r = spawnSync(cmd, {
-		shell: true,
-		cwd,
-		encoding: "utf-8",
-		timeout: 15_000,
-	});
-	return r.stdout ? r.stdout.trim() : "";
+async function run(cmd: string, cwd: string): Promise<string> {
+	try {
+		const { stdout } = await execAsync(cmd, {
+			cwd,
+			encoding: "utf-8",
+			timeout: 15_000,
+		});
+		return stdout.trim();
+	} catch {
+		return "";
+	}
 }
 
-function read(path: string): string | null {
+async function read(path: string): Promise<string | null> {
 	try {
-		return readFileSync(path, "utf-8");
+		return await readFile(path, "utf-8");
 	} catch {
 		return null;
 	}
 }
 
-function isGitRepo(cwd: string): boolean {
+async function isGitRepo(cwd: string): Promise<boolean> {
 	return !!run("git rev-parse --git-dir", cwd);
 }
 
@@ -82,15 +90,17 @@ function tokenCount(text: string): number {
 
 // ── File Inventory ────────────────────────────────────────────────
 
-function listFiles(cwd: string): string[] {
-	if (isGitRepo(cwd)) {
-		const tracked = run("git ls-files", cwd);
-		const untracked = run("git ls-files --others --exclude-standard", cwd);
-		const all = `${tracked}\n${untracked}`
+async function listFiles(cwd: string): Promise<string[]> {
+	const git = await isGitRepo(cwd);
+	if (git) {
+		const [tracked, untracked] = await Promise.all([
+			run("git ls-files", cwd),
+			run("git ls-files --others --exclude-standard", cwd),
+		]);
+		return `${tracked}\n${untracked}`
 			.split("\n")
 			.map((f: string) => f.trim())
 			.filter(Boolean);
-		return all;
 	}
 
 	const SKIP = new Set([
@@ -105,14 +115,15 @@ function listFiles(cwd: string): string[] {
 	]);
 
 	const result: string[] = [];
-	function walk(dir: string) {
+	async function walk(dir: string, depth: number): Promise<void> {
+		if (depth > MAX_DEPTH || result.length >= MAX_FILES) return;
 		try {
-			const entries = readdirSync(dir, { withFileTypes: true });
+			const entries = await readdir(dir, { withFileTypes: true });
 			for (const e of entries) {
 				if (e.isDirectory() && SKIP.has(e.name)) continue;
 				const full = join(dir, e.name);
 				if (e.isDirectory()) {
-					walk(full);
+					await walk(full, depth + 1);
 				} else {
 					result.push(relative(cwd, full));
 				}
@@ -121,7 +132,7 @@ function listFiles(cwd: string): string[] {
 			/* skip unreadable dirs */
 		}
 	}
-	walk(cwd);
+	await walk(cwd, 0);
 	return result;
 }
 
@@ -175,7 +186,7 @@ function countLangs(files: string[]): Record<string, number> {
 	return exts;
 }
 
-function extractMeta(cwd: string, files: string[]): ProjectMeta {
+async function extractMeta(cwd: string, files: string[]): Promise<ProjectMeta> {
 	const meta: ProjectMeta = {
 		name: "",
 		langs: [],
@@ -191,8 +202,8 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 	const fileSet = new Set(files);
 
 	// Git branch
-	if (isGitRepo(cwd)) {
-		meta.branch = run("git branch --show-current", cwd) || "(detached)";
+	if (await isGitRepo(cwd)) {
+		meta.branch = (await run("git branch --show-current", cwd)) || "(detached)";
 	}
 
 	// Languages
@@ -201,9 +212,9 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 	meta.langs = sorted.slice(0, 3).map(([l]) => l);
 
 	// package.json
-	const pkgPath = join(cwd, "package.json");
 	if (fileSet.has("package.json")) {
-		const pkg = JSON.parse(read(pkgPath) || "{}");
+		const pkgRaw = await read(join(cwd, "package.json"));
+		const pkg = pkgRaw ? JSON.parse(pkgRaw) : {};
 		if (pkg.name) meta.name = pkg.name;
 		if (pkg.scripts) {
 			for (const [k, v] of Object.entries(pkg.scripts)) {
@@ -232,7 +243,7 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 
 	// pyproject.toml
 	if (fileSet.has("pyproject.toml")) {
-		const content = read(join(cwd, "pyproject.toml"));
+		const content = await read(join(cwd, "pyproject.toml"));
 		if (content) {
 			const nameM = content.match(/name\s*=\s*"([^"]+)"/);
 			if (nameM && !meta.name) meta.name = nameM[1];
@@ -248,7 +259,7 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 
 	// Cargo.toml
 	if (fileSet.has("Cargo.toml")) {
-		const content = read(join(cwd, "Cargo.toml"));
+		const content = await read(join(cwd, "Cargo.toml"));
 		if (content) {
 			const nameM = content.match(/name\s*=\s*"([^"]+)"/);
 			if (nameM && !meta.name) meta.name = nameM[1];
@@ -257,7 +268,7 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 
 	// go.mod
 	if (fileSet.has("go.mod")) {
-		const content = read(join(cwd, "go.mod"));
+		const content = await read(join(cwd, "go.mod"));
 		if (content) {
 			const modM = content.match(/module\s+(.+)$/m);
 			if (modM && !meta.name) meta.name = modM[1].trim();
@@ -266,15 +277,16 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 
 	// Makefile targets
 	if (fileSet.has("Makefile")) {
-		const content = read(join(cwd, "Makefile"));
+		const content = await read(join(cwd, "Makefile"));
 		if (content) {
-			for (const m of content.matchAll(/^([a-zA-Z][\w-]*)\s*:/m)) {
+			for (const m of content.matchAll(/^([a-zA-Z][\w-]*)\s*:/gm)) {
 				const target = m[1];
 				if (!["all", "clean", "install"].includes(target)) {
 					// Get the first recipe line
-					const targetBlock = content.match(
-						new RegExp(`${target}:\\s*\\n(\\s+.+?)`, "s"),
-					);
+                    const escapedTarget = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    const targetBlock = content.match(
+                        new RegExp(`${escapedTarget}:\s*\n(\s+.+?)`, "s"),
+                    );
 					if (targetBlock) {
 						meta.build[target] = targetBlock[1].trim().split("\n")[0].trim();
 					} else {
@@ -287,9 +299,9 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 
 	// justfile
 	if (fileSet.has("justfile")) {
-		const content = read(join(cwd, "justfile"));
+		const content = await read(join(cwd, "justfile"));
 		if (content) {
-			for (const m of content.matchAll(/^([a-zA-Z][\w-]*)\b/m)) {
+			for (const m of content.matchAll(/^([a-zA-Z][\w-]*)\b/gm)) {
 				const recipe = m[1];
 				if (!meta.build[recipe]) {
 					meta.build[recipe] = "";
@@ -304,7 +316,7 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 			f.startsWith(".github/workflows/") &&
 			(f.endsWith(".yml") || f.endsWith(".yaml"))
 		) {
-			const content = read(join(cwd, f));
+			const content = await read(join(cwd, f));
 			if (content) {
 				// Extract run: commands
 				for (const m of content.matchAll(/run:\s*(.+)$/gm)) {
@@ -314,7 +326,7 @@ function extractMeta(cwd: string, files: string[]): ProjectMeta {
 			}
 		}
 		if (f === ".gitlab-ci.yml") {
-			const content = read(join(cwd, f));
+			const content = await read(join(cwd, f));
 			if (content) {
 				for (const m of content.matchAll(
 					/- (?:sh -c )?["']?([^"'\n]+)["']?/gm,
@@ -452,13 +464,17 @@ const SYM_PATTERNS: Record<string, RegExp[]> = {
 	],
 };
 
-function extractSymbolsFromFile(cwd: string, relPath: string): SymbolInfo[] {
+async function extractSymbolsFromFile(
+	cwd: string,
+	relPath: string,
+): Promise<SymbolInfo[]> {
 	const ext = extname(relPath).toLowerCase();
 	const lang = SYM_PATTERNS[ext.slice(1)] ? ext.slice(1) : null;
 	if (!lang) return [];
 
-	const content = read(join(cwd, relPath));
+	let content = await read(join(cwd, relPath));
 	if (!content) return [];
+	if (content.length > 100_000) content = content.slice(0, 100_000);
 
 	const patterns = SYM_PATTERNS[lang];
 	if (!patterns) return [];
@@ -512,7 +528,10 @@ function extractSymbolsFromFile(cwd: string, relPath: string): SymbolInfo[] {
 	return symbols;
 }
 
-function extractCodeStructure(cwd: string, files: string[]): FileSymbols[] {
+async function extractCodeStructure(
+	cwd: string,
+	files: string[],
+): Promise<FileSymbols[]> {
 	const sourceFiles = files.filter((f) =>
 		SOURCE_EXTS.has(extname(f).toLowerCase()),
 	);
@@ -559,14 +578,15 @@ function extractCodeStructure(cwd: string, files: string[]): FileSymbols[] {
 
 	scored.sort((a, b) => b.score - a.score);
 
-	// Extract symbols from top files until we have enough
+	// Extract symbols from top files until we have enough to display
 	const result: FileSymbols[] = [];
-	const MAX_FILES = 50; // Hard cap on files to parse
+	const MAX_DISPLAYED = 15;
 
-	for (const { file } of scored.slice(0, MAX_FILES)) {
-		const symbols = extractSymbolsFromFile(cwd, file);
+	for (const { file } of scored) {
+		const symbols = await extractSymbolsFromFile(cwd, file);
 		if (symbols.length > 0) {
 			result.push({ path: file, symbols });
+			if (result.length >= MAX_DISPLAYED) break;
 		}
 	}
 
@@ -746,8 +766,10 @@ function truncateToBudget(
 
 // ── Generate Overview ─────────────────────────────────────────────
 
-function generateOverview(cwd: string): { text: string; tokens: number } {
-	const files = listFiles(cwd);
+async function generateOverview(
+	cwd: string,
+): Promise<{ text: string; tokens: number }> {
+	const files = await listFiles(cwd);
 
 	let meta: ProjectMeta = {
 		name: "",
@@ -763,11 +785,11 @@ function generateOverview(cwd: string): { text: string; tokens: number } {
 	let fileSymbols: FileSymbols[] = [];
 
 	if (PASS1_ENABLED) {
-		meta = extractMeta(cwd, files);
+		meta = await extractMeta(cwd, files);
 	}
 
 	if (PASS2_ENABLED) {
-		fileSymbols = extractCodeStructure(cwd, files);
+		fileSymbols = await extractCodeStructure(cwd, files);
 	}
 
 	const formatted = formatOverview(cwd, meta, fileSymbols, TOKEN_BUDGET);
@@ -786,18 +808,20 @@ export default function (pi: ExtensionAPI) {
 		injected = false;
 		sessionHasMessages = false;
 
-		// Check if session already has user messages (resume/fork)
+		// Check if session already has user messages (resume/fork / --continue)
 		const entries = ctx.sessionManager.getEntries();
 		const hasUserMessages = entries.some(
 			(e) => e.type === "message" && e.message?.role === "user",
 		);
 		if (hasUserMessages) {
 			sessionHasMessages = true;
+			updateStatusBar(ctx);
+			return; // Skip discovery for resumed sessions (e.g. pi --continue)
 		}
 
 		// Generate overview
 		try {
-			const result = generateOverview(ctx.cwd);
+			const result = await generateOverview(ctx.cwd);
 			overviewText = result.text;
 			overviewTokens = result.tokens;
 		} catch (err) {
@@ -809,11 +833,6 @@ export default function (pi: ExtensionAPI) {
 
 		// Update status bar
 		updateStatusBar(ctx);
-
-		// If session already has messages, mark as fulfilled immediately
-		if (sessionHasMessages) {
-			injected = true;
-		}
 	});
 
 	pi.on("before_agent_start", async (_event, _ctx) => {
@@ -848,11 +867,8 @@ export default function (pi: ExtensionAPI) {
 				"discovery",
 				`│ ${theme.bg("customMessageBg", theme.fg("dim", `discovery: ${overviewTokens}t`))}`,
 			);
-		} else if (injected || sessionHasMessages) {
-			ctx.ui.setStatus(
-				"discovery",
-				`│ ${theme.bg("customMessageBg", theme.fg("dim", "discovery: fulfilled"))}`,
-			);
+		} else {
+			ctx.ui.setStatus("discovery", undefined);
 		}
 	}
 
@@ -862,7 +878,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args: string | undefined, ctx) => {
 			if (args?.trim() === "regen") {
 				try {
-					const result = generateOverview(ctx.cwd);
+					const result = await generateOverview(ctx.cwd);
 					overviewText = result.text;
 					overviewTokens = result.tokens;
 					injected = false; // Force re-injection on next turn
