@@ -11,12 +11,13 @@ import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, readdir } from "node:fs/promises";
-import { basename } from "node:path";
-import { join, relative, dirname, extname } from "node:path";
+import { basename, join, relative, extname } from "node:path";
 
 const execAsync = promisify(exec);
 const MAX_DEPTH = 5;
 const MAX_FILES = 5000;
+// Max number of source files listed in the `api:` section of the overview.
+const MAX_DISPLAYED_FILES = 15;
 
 // ── Config ────────────────────────────────────────────────────────
 
@@ -77,7 +78,7 @@ async function read(path: string): Promise<string | null> {
 }
 
 async function isGitRepo(cwd: string): Promise<boolean> {
-	return !!run("git rev-parse --git-dir", cwd);
+	return !!(await run("git rev-parse --git-dir", cwd));
 }
 
 function tokenCount(text: string): number {
@@ -90,8 +91,7 @@ function tokenCount(text: string): number {
 
 // ── File Inventory ────────────────────────────────────────────────
 
-async function listFiles(cwd: string): Promise<string[]> {
-	const git = await isGitRepo(cwd);
+async function listFiles(cwd: string, git: boolean): Promise<string[]> {
 	if (git) {
 		const [tracked, untracked] = await Promise.all([
 			run("git ls-files", cwd),
@@ -186,7 +186,11 @@ function countLangs(files: string[]): Record<string, number> {
 	return exts;
 }
 
-async function extractMeta(cwd: string, files: string[]): Promise<ProjectMeta> {
+async function extractMeta(
+	cwd: string,
+	files: string[],
+	git: boolean,
+): Promise<ProjectMeta> {
 	const meta: ProjectMeta = {
 		name: "",
 		langs: [],
@@ -202,7 +206,7 @@ async function extractMeta(cwd: string, files: string[]): Promise<ProjectMeta> {
 	const fileSet = new Set(files);
 
 	// Git branch
-	if (await isGitRepo(cwd)) {
+	if (git) {
 		meta.branch = (await run("git branch --show-current", cwd)) || "(detached)";
 	}
 
@@ -282,13 +286,16 @@ async function extractMeta(cwd: string, files: string[]): Promise<ProjectMeta> {
 			for (const m of content.matchAll(/^([a-zA-Z][\w-]*)\s*:/gm)) {
 				const target = m[1];
 				if (!["all", "clean", "install"].includes(target)) {
-					// Get the first recipe line
-                    const escapedTarget = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                    const targetBlock = content.match(
-                        new RegExp(`${escapedTarget}:\s*\n(\s+.+?)`, "s"),
-                    );
+					// Get the first recipe line (a tab-indented line after the target)
+					const escapedTarget = target.replace(
+						/[.*+?^${}()|[\]\\]/g,
+						"\\$&",
+					);
+					const targetBlock = content.match(
+						new RegExp(`^${escapedTarget}:[^\\n]*\\n\\s+(.+)$`, "m"),
+					);
 					if (targetBlock) {
-						meta.build[target] = targetBlock[1].trim().split("\n")[0].trim();
+						meta.build[target] = targetBlock[1].trim();
 					} else {
 						meta.build[target] = "";
 					}
@@ -464,6 +471,31 @@ const SYM_PATTERNS: Record<string, RegExp[]> = {
 	],
 };
 
+// Keywords that broad function-like patterns can falsely capture
+// (e.g. `if (...) {`, `for (...) {`) — never treat these as symbols.
+const KEYWORDS = new Set([
+	"if",
+	"for",
+	"while",
+	"switch",
+	"catch",
+	"return",
+	"else",
+	"do",
+	"function",
+	"class",
+	"const",
+	"let",
+	"var",
+	"new",
+	"await",
+	"yield",
+	"typeof",
+	"throw",
+	"super",
+	"with",
+]);
+
 async function extractSymbolsFromFile(
 	cwd: string,
 	relPath: string,
@@ -483,12 +515,19 @@ async function extractSymbolsFromFile(
 	const symbols: SymbolInfo[] = [];
 
 	for (const pattern of patterns) {
-		pattern.lastIndex = 0;
-		for (const match of content.matchAll(
-			new RegExp(pattern.source, pattern.flags),
-		)) {
-			const name = match[1];
-			if (!name || seen.has(name)) continue;
+		// matchAll clones the global regex internally, so the shared pattern
+		// can be reused directly without resetting lastIndex.
+		for (const match of content.matchAll(pattern)) {
+			// The symbol name is the last captured group (handles patterns like
+			// Java methods where group 1 is the return type and group 2 the name).
+			let name: string | undefined;
+			for (let i = match.length - 1; i >= 1; i--) {
+				if (match[i]) {
+					name = match[i];
+					break;
+				}
+			}
+			if (!name || seen.has(name) || KEYWORDS.has(name)) continue;
 			seen.add(name);
 
 			// Determine if exported
@@ -580,22 +619,13 @@ async function extractCodeStructure(
 
 	// Extract symbols from top files until we have enough to display
 	const result: FileSymbols[] = [];
-	const MAX_DISPLAYED = 15;
 
 	for (const { file } of scored) {
 		const symbols = await extractSymbolsFromFile(cwd, file);
 		if (symbols.length > 0) {
 			result.push({ path: file, symbols });
-			if (result.length >= MAX_DISPLAYED) break;
+			if (result.length >= MAX_DISPLAYED_FILES) break;
 		}
-	}
-
-	// Rank symbols by: exported > non-exported, and by file score
-	// Simple cross-file reference heuristic: count how many files import from the same directory
-	const dirCounts = new Map<string, number>();
-	for (const f of sourceFiles) {
-		const d = dirname(f);
-		dirCounts.set(d, (dirCounts.get(d) || 0) + 1);
 	}
 
 	// Sort symbols within file: exported first
@@ -668,7 +698,6 @@ function formatOverview(
 	// Code structure (Pass 2)
 	if (fileSymbols.length > 0) {
 		lines.push("api:");
-		const MAX_DISPLAYED = 15;
 		let displayed = 0;
 		let totalFiles = fileSymbols.length;
 		let totalSymbols = fileSymbols.reduce(
@@ -677,7 +706,7 @@ function formatOverview(
 		);
 
 		for (const fs of fileSymbols) {
-			if (displayed >= MAX_DISPLAYED) break;
+			if (displayed >= MAX_DISPLAYED_FILES) break;
 			const symStr = fs.symbols
 				.slice(0, 8)
 				.map((s) => `${s.name}${s.sig}`)
@@ -769,7 +798,8 @@ function truncateToBudget(
 async function generateOverview(
 	cwd: string,
 ): Promise<{ text: string; tokens: number }> {
-	const files = await listFiles(cwd);
+	const git = await isGitRepo(cwd);
+	const files = await listFiles(cwd, git);
 
 	let meta: ProjectMeta = {
 		name: "",
@@ -785,7 +815,7 @@ async function generateOverview(
 	let fileSymbols: FileSymbols[] = [];
 
 	if (PASS1_ENABLED) {
-		meta = await extractMeta(cwd, files);
+		meta = await extractMeta(cwd, files, git);
 	}
 
 	if (PASS2_ENABLED) {
@@ -865,7 +895,7 @@ export default function (pi: ExtensionAPI) {
 		if (!sessionHasMessages && overviewTokens > 0) {
 			ctx.ui.setStatus(
 				"discovery",
-				`│ ${theme.bg("customMessageBg", theme.fg("dim", `discovery: ${overviewTokens}t`))}`,
+				theme.bg("customMessageBg", theme.fg("dim", `discovery: ${overviewTokens}t`)),
 			);
 		} else {
 			ctx.ui.setStatus("discovery", undefined);
