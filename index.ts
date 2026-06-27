@@ -697,7 +697,7 @@ function formatOverview(
 
 	// Code structure (Pass 2)
 	if (fileSymbols.length > 0) {
-		lines.push("api:");
+		lines.push("symbols (file: exports):");
 		let displayed = 0;
 		let totalFiles = fileSymbols.length;
 		let totalSymbols = fileSymbols.reduce(
@@ -712,7 +712,7 @@ function formatOverview(
 				.map((s) => `${s.name}${s.sig}`)
 				.join("  ");
 			const extra = fs.symbols.length > 8 ? ` +${fs.symbols.length - 8}` : "";
-			lines.push(` ${fs.path}: ${symStr}${extra}`);
+			lines.push(` ./${fs.path}: ${symStr}${extra}`);
 			displayed++;
 			totalSymbols -= fs.symbols.length;
 			totalFiles--;
@@ -739,7 +739,7 @@ function truncateToBudget(
 
 	// Truncate from the end, line by line
 	const lines = text.split("\n");
-	const apiStart = lines.findIndex((l) => l === "api:");
+	const apiStart = lines.findIndex((l) => l === "symbols (file: exports):");
 
 	if (apiStart >= 0) {
 		// Keep header, truncate api entries
